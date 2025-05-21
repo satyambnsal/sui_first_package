@@ -1,1 +1,34 @@
 build/*
+# Node modules
+node_modules/
+
+# Build output
+dist/
+.vite/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env files
+.env
+.env.*.local
+
+# Editor directories and files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# MacOS files
+.DS_Store
+
+# Optional: if using TypeScript
+*.tsbuildinfo
+
+# Optional: OS-specific files
+Thumbs.db
