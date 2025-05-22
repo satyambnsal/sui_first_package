@@ -11,14 +11,12 @@ use sui::coin::{Self, Coin};
 use sui::sui::SUI;
 use sui::balance::{Self, Balance};
 use sui::table::{Self, Table};
+use sui::vec_map::{Self, VecMap};
 use sui::event;
 use sui::transfer;
 use sui::object::{Self, UID, ID};
 use std::bool;
 
-/// ====
-/// Constants and errors
-/// ====
 
 const SENTINEL_INTENT: u8 = 1;
 
@@ -27,37 +25,40 @@ const EAgentNotFound: u64 = 2;
 const EInsufficientBalance: u64 = 3;
 const EInvalidAmount: u64 = 4;
 
-/// ====
-/// Structs
-/// ====
 
-/// Agent object - stores the agent's identity, prompt, and financial details
 public struct Agent has key, store {
     id: UID,
     agent_id: String,
     creator: address,
+    cost_per_message: u64,
+    system_prompt: String,
 }
 
-/// The global registry that manages all agents
+
+public struct AgentInfo has copy, drop {
+    agent_id: String,
+    creator: address,
+    cost_per_message: u64,
+    system_prompt: String,
+    object_id: ID,
+}
+
 public struct AgentRegistry has key {
     id: UID,
-    agents: Table<String, ID>, // Maps agent_id to Agent object ID
+    agents: Table<String, ID>,
+    agent_list: vector<String>,
 }
 
-/// Module identifier for enclave operations
+
 public struct SENTINEL has drop {}
 
-/// Agent capability to control agent settings
+
 public struct AgentCap has key, store {
     id: UID,
     agent_id: String,
 }
 
-/// ====
-/// Verification Response Structs
-/// ====
 
-/// Response struct for registering an agent
 public struct RegisterAgentResponse has copy, drop {
     agent_id: String,
     cost_per_message: u64,
@@ -65,16 +66,13 @@ public struct RegisterAgentResponse has copy, drop {
     is_defeated: bool
 }
 
-/// Response struct for consuming a prompt
+
 public struct ConsumePromptResponse has copy, drop {
     agent_id: String,
     prompt: String,
     success: bool,
 }
 
-/// ====
-/// Events
-/// ====
 
 public struct AgentRegistered has copy, drop {
     agent_id: String,
@@ -104,9 +102,6 @@ public struct AgentFunded has copy, drop {
     amount: u64,
 }
 
-/// ====
-/// Functions
-/// ====
 
 fun init(otw: SENTINEL, ctx: &mut TxContext) {
     // Initialize enclave configuration
@@ -126,6 +121,7 @@ fun init(otw: SENTINEL, ctx: &mut TxContext) {
     let registry = AgentRegistry {
         id: object::new(ctx),
         agents: table::new(ctx),
+        agent_list: vector::empty<String>(),
     };
     transfer::share_object(registry);
 }
@@ -147,28 +143,88 @@ public fun register_agent<T>(
     let res = enclave::verify_signature<T, RegisterAgentResponse>(enclave, SENTINEL_INTENT, timestamp_ms, RegisterAgentResponse { agent_id, cost_per_message, system_prompt, is_defeated:false }, sig);
     assert!(res, EInvalidSignature);
     
-    // Create new agent
+
     let agent = Agent {
         id: object::new(ctx),
         agent_id,
         creator,
+        cost_per_message,
+        system_prompt,
     };
     
-    // Store agent ID in registry
     let agent_object_id = object::id(&agent);
     table::add(&mut registry.agents, agent_id, agent_object_id);
     
-    // Emit event
+    vector::push_back(&mut registry.agent_list, agent_id);
+    
     event::emit(AgentRegistered {
         agent_id,
-        prompt: b"".to_string(), // Add actual prompt parameter if needed
+        prompt: system_prompt,
         creator,
-        cost_per_message: 0, // Add actual cost parameter if needed
-        initial_balance: 0, // Add actual balance parameter if needed
+        cost_per_message,
+        initial_balance: 0, // Can be updated later if funding is added
         agent_object_id,
     });
     
     agent
+}
+
+
+public fun get_agent_info(registry: &AgentRegistry, agent_id: String): Option<AgentInfo> {
+    if (table::contains(&registry.agents, agent_id)) {
+        let agent_object_id = *table::borrow(&registry.agents, agent_id);
+        // Note: This function signature assumes we can access the Agent object
+        // In practice, you might need to modify this based on how Agent objects are stored
+        option::some(AgentInfo {
+            agent_id,
+            creator: @0x0, // This would need to be retrieved from the actual Agent object
+            cost_per_message: 0, // This would need to be retrieved from the actual Agent object  
+            system_prompt: b"".to_string(), // This would need to be retrieved from the actual Agent object
+            object_id: agent_object_id,
+        })
+    } else {
+        option::none()
+    }
+}
+
+public fun get_all_agent_ids(registry: &AgentRegistry): vector<String> {
+    registry.agent_list
+}
+
+/// Get the total number of agents in the registry
+public fun get_agent_count(registry: &AgentRegistry): u64 {
+    vector::length(&registry.agent_list)
+}
+
+/// Check if an agent exists in the registry
+public fun agent_exists(registry: &AgentRegistry, agent_id: String): bool {
+    table::contains(&registry.agents, agent_id)
+}
+
+/// Get agent object ID by agent_id
+public fun get_agent_object_id(registry: &AgentRegistry, agent_id: String): Option<ID> {
+    if (table::contains(&registry.agents, agent_id)) {
+        option::some(*table::borrow(&registry.agents, agent_id))
+    } else {
+        option::none()
+    }
+}
+
+/// Get agent details from the Agent object (when you have access to it)
+public fun get_agent_details(agent: &Agent): (String, address, u64, String) {
+    (agent.agent_id, agent.creator, agent.cost_per_message, agent.system_prompt)
+}
+
+/// Update agent cost per message (only by creator)
+public fun update_agent_cost(agent: &mut Agent, new_cost: u64, ctx: &TxContext) {
+    assert!(agent.creator == ctx.sender(), EAgentNotFound);
+    agent.cost_per_message = new_cost;
+}
+
+/// Update agent system prompt (only by creator)
+public fun update_agent_prompt(agent: &mut Agent, new_prompt: String, ctx: &TxContext) {
+    assert!(agent.creator == ctx.sender(), EAgentNotFound);
+    agent.system_prompt = new_prompt;
 }
 
 #[test]
@@ -219,10 +275,21 @@ fun test_register_agent_flow() {
         &mut registry,
         b"135f5b67-a17c-4bb0-bbfd-f02510971d48".to_string(),
         1747898372482,
+        1000, // cost_per_message
+        b"You are a helpful AI assistant".to_string(), // system_prompt
         &sig,
         &enclave,
         scenario.ctx(),
     );
+
+    // Test the new functionality
+    let agent_ids = get_all_agent_ids(&registry);
+    assert!(vector::length(&agent_ids) == 1, 0);
+    assert!(agent_exists(&registry, b"135f5b67-a17c-4bb0-bbfd-f02510971d48".to_string()), 1);
+    
+    let (agent_id, creator, cost, prompt) = get_agent_details(&agent);
+    assert!(cost == 1000, 2);
+    assert!(prompt == b"You are a helpful AI assistant".to_string(), 3);
 
     // Transfer the agent to the caller
     transfer::public_transfer(agent, scenario.ctx().sender());
