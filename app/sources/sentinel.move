@@ -1,6 +1,8 @@
 // Copyright (c), Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#[allow(unused_field, unused_const, unused_use)]
+
 module app::sentinel;
 
 use enclave::enclave::{Self, Enclave};
@@ -31,10 +33,7 @@ const EInvalidAmount: u64 = 4;
 public struct Agent has key, store {
     id: UID,
     agent_id: String,
-    prompt: String,
     creator: address,
-    cost_per_message: u64,
-    balance: Balance<SUI>,  // Funds available for rewards
 }
 
 /// The global registry that manages all agents
@@ -59,9 +58,6 @@ public struct AgentCap has key, store {
 /// Response struct for registering an agent
 public struct RegisterAgentResponse has copy, drop {
     agent_id: String,
-    prompt: String,
-    creator: address,
-    cost_per_message: u64,
 }
 
 /// Response struct for consuming a prompt
@@ -109,276 +105,113 @@ public struct AgentFunded has copy, drop {
 
 fun init(otw: SENTINEL, ctx: &mut TxContext) {
     // Initialize enclave configuration
-    let cap = enclave::new_cap(otw, ctx);
+      let cap = enclave::new_cap(otw, ctx);
+
     cap.create_enclave_config(
-        b"agent challenge enclave".to_string(),
+        b"sentinel enclave".to_string(),
         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", // pcr0
         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", // pcr1
         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", // pcr2
         ctx,
     );
 
-    // Create and share agent registry
-    let registry = AgentRegistry {
-        id: object::new(ctx),
-        agents: table::new(ctx),
-    };
-    
-    // Transfer capability to sender
-    transfer::public_transfer(cap, tx_context::sender(ctx));
-    
-    // Share registry
-    transfer::share_object(registry);
+    transfer::public_transfer(cap, ctx.sender())
+    // Share registr
 }
 
 /// Register a new agent with its prompt, cost per message, and initial funds
 #[allow(lint(self_transfer))]
 public fun register_agent<T>(
     agent_id: String,
-    prompt: String,
-    cost_per_message: u64,
-    initial_funds: Coin<SUI>,
+    timestamp_ms: u64,
     sig: &vector<u8>,
     enclave: &Enclave<T>,
-    registry: &mut AgentRegistry,
     ctx: &mut TxContext,
-) {
+): Agent {
     let creator = tx_context::sender(ctx);
     
     // Verify signature from the enclave
     let res = enclave.verify_signature(
         SENTINEL_INTENT,
-        tx_context::epoch(ctx),
+        timestamp_ms,
         RegisterAgentResponse { 
             agent_id, 
-            prompt, 
-            creator,
-            cost_per_message
         },
         sig,
     );
     assert!(res, EInvalidSignature);
     
     // Get initial funds
-    let initial_balance = coin::into_balance(initial_funds);
-    let initial_amount = balance::value(&initial_balance);
+    // let initial_balance = coin::into_balance(initial_funds);
+    // let initial_amount = balance::value(&initial_balance);
     
     // Create new agent
     let agent = Agent {
         id: object::new(ctx),
         agent_id,
-        prompt,
         creator,
-        cost_per_message,
-        balance: initial_balance,
     };
+    agent
     
-    let agent_object_id = object::id(&agent);
-    
-    // Add agent to registry
-    table::add(&mut registry.agents, agent_id, agent_object_id);
-    
-    // Create and transfer agent capability to sender
-    let cap = AgentCap {
-        id: object::new(ctx),
-        agent_id,
-    };
-    transfer::public_transfer(cap, creator);
-    
-    // Share agent object
-    transfer::share_object(agent);
-    
-    // Emit event
-    event::emit(AgentRegistered {
-        agent_id,
-        prompt,
-        creator,
-        cost_per_message,
-        initial_balance: initial_amount,
-        agent_object_id,
-    });
 }
 
-/// Consume a prompt and handle rewards based on success
-#[allow(lint(self_transfer))]
-public fun consume_prompt<T>(
-    agent_id: String,
-    prompt: String,
-    success: bool,
-    payment: Coin<SUI>,
-    reward_amount: u64,
-    sig: &vector<u8>,
-    enclave: &Enclave<T>,
-    registry: &AgentRegistry,
-    agent: &mut Agent,
-    ctx: &mut TxContext,
-) {
-    // Verify signature from enclave
-    let res = enclave.verify_signature(
-        SENTINEL_INTENT,
-        tx_context::epoch(ctx),
-        ConsumePromptResponse { agent_id, prompt, success },
-        sig,
+
+
+
+#[test]
+fun test_register_angent_flow() {
+    use sui::test_scenario::{Self, ctx, next_tx};
+    use sui::nitro_attestation;
+    use sui::test_utils::destroy;
+    use enclave::enclave::{register_enclave, create_enclave_config, update_pcrs, EnclaveConfig};
+
+    let mut scenario = test_scenario::begin(@0x1);
+    let mut clock = sui::clock::create_for_testing(scenario.ctx());
+    clock.set_for_testing(1744684007462);
+
+    let cap = enclave::new_cap(SENTINEL {}, scenario.ctx());
+    cap.create_enclave_config(
+        b"weather enclave".to_string(),
+        x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        scenario.ctx(),
     );
-    assert!(res, EInvalidSignature);
-    
-    // Verify agent exists and matches
-    assert!(table::contains(&registry.agents, agent_id), EAgentNotFound);
-    assert!(agent.agent_id == agent_id, EAgentNotFound);
-    
-    // Verify payment covers cost per message
-    let payment_amount = coin::value(&payment);
-    assert!(payment_amount >= agent.cost_per_message, EInvalidAmount);
-    
-    // Process payment
-    let mut payment_balance = coin::into_balance(payment);
-    
-    // Extract fee for agent creator
-    let creator_fee = balance::split(&mut payment_balance, agent.cost_per_message);
-    let creator_coin = coin::from_balance(creator_fee, ctx);
-    
-    // Send fee to agent creator
-    transfer::public_transfer(creator_coin, agent.creator);
-    
-    // Add remaining payment (if any) to agent balance
-    if (balance::value(&payment_balance) > 0) {
-        balance::join(&mut agent.balance, payment_balance);
-    } else {
-        balance::destroy_zero(payment_balance);
-    };
-    
-    // Emit fee transfer event
-    event::emit(FeeTransferred {
-        agent_id,
-        creator: agent.creator,
-        amount: agent.cost_per_message,
-    });
-    
-    if (success) {
-        // User succeeded in fooling the agent, pay them the reward
-        assert!(balance::value(&agent.balance) >= reward_amount, EInsufficientBalance);
-        
-        // Send reward to user
-        let reward = coin::from_balance(balance::split(&mut agent.balance, reward_amount), ctx);
-        transfer::public_transfer(reward, tx_context::sender(ctx));
-    };
-    let amount = if (success) { reward_amount } else { 0 };
-    
-    // Emit event
-    event::emit(PromptConsumed {
-        agent_id,
-        prompt,
-        success,
-        amount ,
-        sender: tx_context::sender(ctx),
-    });
+
+    scenario.next_tx(@0x1);
+
+    let mut config = scenario.take_shared<EnclaveConfig<SENTINEL>>();
+
+    config.update_pcrs(
+        &cap,
+        x"cbe1afb6ed0ff89f10295af0b802247ec5670da8f886e71a4226373b032c322f4e42c9c98288e7211682b258684505a2",
+        x"cbe1afb6ed0ff89f10295af0b802247ec5670da8f886e71a4226373b032c322f4e42c9c98288e7211682b258684505a2",
+        x"21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a",
+    );
+
+    scenario.next_tx(@0x1);
+    let payload =
+        x"8444a1013822a059111fa9696d6f64756c655f69647827692d30376432313131626365353038313465312d656e633031393666366532376165346134653166646967657374665348413338346974696d657374616d701b00000196f6e43be36470637273b0005830566b27dd57d5595ed526ddbd3ed3f8b82f128853fa6550013f57648f71c81305b5f6aded6e4cc2363e7506ed92cb1865015830566b27dd57d5595ed526ddbd3ed3f8b82f128853fa6550013f57648f71c81305b5f6aded6e4cc2363e7506ed92cb186502583021b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a035830000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045830cdfd0c3d763862bbe025eb6ba8cbd393e68f81063f7630c5f66acc686f357cf36cc788601ea97b8059fa4f9671fec6da0558300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000658300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000758300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000858300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000958300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f58300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006b636572746966696361746559027e3082027a30820201a00302010202100196f6e27ae4a4e100000000682ed1fa300a06082a8648ce3d04030330818e310b30090603550406130255533113301106035504080c0a57617368696e67746f6e3110300e06035504070c0753656174746c65310f300d060355040a0c06416d617a6f6e310c300a060355040b0c034157533139303706035504030c30692d30376432313131626365353038313465312e75732d656173742d312e6177732e6e6974726f2d656e636c61766573301e170d3235303532323037323735315a170d3235303532323130323735345a308193310b30090603550406130255533113301106035504080c0a57617368696e67746f6e3110300e06035504070c0753656174746c65310f300d060355040a0c06416d617a6f6e310c300a060355040b0c03415753313e303c06035504030c35692d30376432313131626365353038313465312d656e63303139366636653237616534613465312e75732d656173742d312e6177733076301006072a8648ce3d020106052b810400220362000424aa59f10707988c97a27162a2885d001db3d5e72aef72f4fdcb456528c60ffda5cb1273075e1a51a4fedd99607d6dda4b2d228ae025a32ae4024a7035b87de49cd782d56c22e3155244855ba3da46b5898b07254e95560e7b7c442bcbb8dc19a31d301b300c0603551d130101ff04023000300b0603551d0f0404030206c0300a06082a8648ce3d0403030367003064023046f1baa55339ce95137accfd9be85d9adf7277d6ca503406dc1fd0583352a6cfaf29511f40297803b3fcc9077ebbbffd02303a4a00e61f5784ab2526b1be5492c9acd1e752ab50f6be878c281ff10769c853e5df4e66ad5ce618d0336de9d3ff32a868636162756e646c65845902153082021130820196a003020102021100f93175681b90afe11d46ccb4e4e7f856300a06082a8648ce3d0403033049310b3009060355040613025553310f300d060355040a0c06416d617a6f6e310c300a060355040b0c03415753311b301906035504030c126177732e6e6974726f2d656e636c61766573301e170d3139313032383133323830355a170d3439313032383134323830355a3049310b3009060355040613025553310f300d060355040a0c06416d617a6f6e310c300a060355040b0c03415753311b301906035504030c126177732e6e6974726f2d656e636c617665733076301006072a8648ce3d020106052b8104002203620004fc0254eba608c1f36870e29ada90be46383292736e894bfff672d989444b5051e534a4b1f6dbe3c0bc581a32b7b176070ede12d69a3fea211b66e752cf7dd1dd095f6f1370f4170843d9dc100121e4cf63012809664487c9796284304dc53ff4a3423040300f0603551d130101ff040530030101ff301d0603551d0e041604149025b50dd90547e796c396fa729dcf99a9df4b96300e0603551d0f0101ff040403020186300a06082a8648ce3d0403030369003066023100a37f2f91a1c9bd5ee7b8627c1698d255038e1f0343f95b63a9628c3d39809545a11ebcbf2e3b55d8aeee71b4c3d6adf3023100a2f39b1605b27028a5dd4ba069b5016e65b4fbde8fe0061d6a53197f9cdaf5d943bc61fc2beb03cb6fee8d2302f3dff65902c3308202bf30820245a003020102021100b5241932a930745cc742c0d8f8e3599c300a06082a8648ce3d0403033049310b3009060355040613025553310f300d060355040a0c06416d617a6f6e310c300a060355040b0c03415753311b301906035504030c126177732e6e6974726f2d656e636c61766573301e170d3235303532313132333235355a170d3235303631303133333235355a3064310b3009060355040613025553310f300d060355040a0c06416d617a6f6e310c300a060355040b0c034157533136303406035504030c2d646130396239353933393438303265382e75732d656173742d312e6177732e6e6974726f2d656e636c617665733076301006072a8648ce3d020106052b8104002203620004e5e225e3c720414bd39cc2b0442e1c8ff2d37230d5ab05c8086800ed4414d45ac766855df95de1a499dba2b5c890bee3989257ad722b7b77f3e69848a25c0f38c7a7d34256ce053fd55cb490d30edef917f0b6314731b9f2318ab72f0f5aa6c7a381d53081d230120603551d130101ff040830060101ff020102301f0603551d230418301680149025b50dd90547e796c396fa729dcf99a9df4b96301d0603551d0e0416041438d531143ce74f8a64f121fb4031a4bffcba0a43300e0603551d0f0101ff040403020186306c0603551d1f046530633061a05fa05d865b687474703a2f2f6177732d6e6974726f2d656e636c617665732d63726c2e73332e616d617a6f6e6177732e636f6d2f63726c2f61623439363063632d376436332d343262642d396539662d3539333338636236376638342e63726c300a06082a8648ce3d040303036800306502306549d1009dc1d07acad4dd47339dfebfff0ae60ef914b7da88bdb55839ef0f5a0cd284e8311e7f086acf6ef977278dd3023100820e81bf03f8dd80c1920d07821789df876ee10771d9790fc9057fb07d5a76030eabb3ccbab8745d3bb1aafb3f2eaa0b590318308203143082029aa00302010202102817ad868a7a7189222be30ece2bb6cd300a06082a8648ce3d0403033064310b3009060355040613025553310f300d060355040a0c06416d617a6f6e310c300a060355040b0c034157533136303406035504030c2d646130396239353933393438303265382e75732d656173742d312e6177732e6e6974726f2d656e636c61766573301e170d3235303532313233343435315a170d3235303532383030343435315a308189313c303a06035504030c33666266363561343430313434666633312e7a6f6e616c2e75732d656173742d312e6177732e6e6974726f2d656e636c61766573310c300a060355040b0c03415753310f300d060355040a0c06416d617a6f6e310b3009060355040613025553310b300906035504080c0257413110300e06035504070c0753656174746c653076301006072a8648ce3d020106052b81040022036200048a8769dda9a9c316e0ab206d5cfc3a1e325d9045c7d46a70110e0d57939cd9e60ea66a78d9205ba5dfdb043e1aeca914dd78941a337d7570b2272714725ff41ef51b6f07935b43ae2df940c539a7d3c1f319ae343ec5bbfa897b202a89c05a48a381ea3081e730120603551d130101ff040830060101ff020101301f0603551d2304183016801438d531143ce74f8a64f121fb4031a4bffcba0a43301d0603551d0e04160414c995a3f3d7da222321271b69cd564f9d9d75aca5300e0603551d0f0101ff0404030201863081800603551d1f047930773075a073a071866f687474703a2f2f63726c2d75732d656173742d312d6177732d6e6974726f2d656e636c617665732e73332e75732d656173742d312e616d617a6f6e6177732e636f6d2f63726c2f34303365303766382d623564352d343435342d626265312d6665656164376139376662302e63726c300a06082a8648ce3d040303036800306502305ea591af89e376f15e52e9275f854065c3c5b4fe7f7163720384730039fe80e29b4469d3dff0ece9534b863b6a3b8227023100f9fcfda647a4ec2c003b0e4dd2275ee9420688d63c03d566e74e6efd0b0471e707be0f1eadc0cd757b729b48fa0c0d295902c2308202be30820244a00302010202140e8d9f323bf974f4b3b6a0d9b5b87b4c844011fc300a06082a8648ce3d040303308189313c303a06035504030c33666266363561343430313434666633312e7a6f6e616c2e75732d656173742d312e6177732e6e6974726f2d656e636c61766573310c300a060355040b0c03415753310f300d060355040a0c06416d617a6f6e310b3009060355040613025553310b300906035504080c0257413110300e06035504070c0753656174746c65301e170d3235303532323035323833385a170d3235303532333035323833385a30818e310b30090603550406130255533113301106035504080c0a57617368696e67746f6e3110300e06035504070c0753656174746c65310f300d060355040a0c06416d617a6f6e310c300a060355040b0c034157533139303706035504030c30692d30376432313131626365353038313465312e75732d656173742d312e6177732e6e6974726f2d656e636c617665733076301006072a8648ce3d020106052b81040022036200045b27cc9f1b6591adbf405ccdbcd9e825a65a7a1f1b9c061615c1d2884a8e4367f4803f69d580c2924fb1b8fe6e387fd76918579c18e70b2065f589d5194466e34237f805a1be73df3bc163684cbc4f253b2f0d1b6b87aaee547ec9c1686dc9e8a366306430120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020204301d0603551d0e04160414b1cf5a78fbc30e2518d24996187bf5254e125f57301f0603551d23041830168014c995a3f3d7da222321271b69cd564f9d9d75aca5300a06082a8648ce3d040303036800306502305088d7fcd706af262647993b015a770df918953a70b5aa6042b046fb03a0f92fa32adfb36e35152bf2a607ddabc8ca4a0231009d1e87fbe3a1cdfd2232d55c01811176da7b1e778323e3293456ec27e52c24da5168153ec8aaea7aded9b662e236adc36a7075626c69635f6b6579582095fa41f7e34c773ade7e14b3436f59f6997675ac351193bd0f0a37c51b8ea63e69757365725f64617461f6656e6f6e6365f65860ebc761141d54d236ddf8f737ca96af4feb5facfe88c6b6d6817a9581a29118699796e76d298bf377800740beb8d8eeae7ae913b1431703b4fcb37b5bece6698fc2ae6ed7c13ff446864870e7f4dad11e66721ab1f8b0a4d244b2a5e4baa4954c";
+    let document = nitro_attestation::load_nitro_attestation(payload, &clock);
+    config.register_enclave(document, scenario.ctx());
+
+    scenario.next_tx(@0x4668aa5963dacfe3e169be3cf824395ab9de3f0a544fc2ca638858a536b5ff4b);
+
+    let enclave = scenario.take_shared<Enclave<SENTINEL>>();
+
+    let sig =
+        x"b5b70ffde62eb6facf2ab01f03fa0124e9bf646b094e8699c64b964b8dccad42f4a9dc3beccee25b5e7ab5ed3f53cef5d30300af06539f7ed51c842dd3c35603";
+    let agent = register_agent(
+        b"135f5b67-a17c-4bb0-bbfd-f02510971d48".to_string(),
+        1747898372482,
+        &sig,
+        &enclave,
+        scenario.ctx(),
+    );
+
+    test_scenario::return_shared(config);
+    clock.destroy_for_testing();
+    enclave.destroy();
+    destroy(cap);
+    scenario.end();
 }
-
-/// Add funds to an agent's balance
-public entry fun add_funds_to_agent(
-    agent: &mut Agent,
-    funds: Coin<SUI>,
-    _cap: &AgentCap,
-) {
-    // Verify cap matches agent
-    assert!(_cap.agent_id == agent.agent_id, EAgentNotFound);
-    
-    let amount = coin::value(&funds);
-    let funds_balance = coin::into_balance(funds);
-    
-    // Add funds to agent balance
-    balance::join(&mut agent.balance, funds_balance);
-    
-    // Emit event
-    event::emit(AgentFunded {
-        agent_id: agent.agent_id,
-        amount,
-    });
-}
-
-/// Update cost per message
-public entry fun update_cost_per_message(
-    agent: &mut Agent,
-    new_cost: u64,
-    _cap: &AgentCap,
-) {
-    // Verify cap matches agent
-    assert!(_cap.agent_id == agent.agent_id, EAgentNotFound);
-    
-    // Update cost
-    agent.cost_per_message = new_cost;
-}
-
-/// Get agent ID by agent_id string
-public fun fetch_agent_by_id(
-    agent_id: String,
-    registry: &AgentRegistry,
-): Option<ID> {
-    if (table::contains(&registry.agents, agent_id)) {
-        option::some(*table::borrow(&registry.agents, agent_id))
-    } else {
-        option::none()
-    }
-}
-
-/// Get cost per message for an agent
-public fun get_cost_per_message(agent: &Agent): u64 {
-    agent.cost_per_message
-}
-
-/// Get agent balance
-public fun get_agent_balance(agent: &Agent): u64 {
-    balance::value(&agent.balance)
-}
-
-/// Get agent creator
-public fun get_agent_creator(agent: &Agent): address {
-    agent.creator
-}
-
-// #[test]
-// fun test_agent_challenge_flow() {
-//     use sui::test_scenario;
-//     use sui::nitro_attestation;
-//     use sui::test_utils::destroy;
-//     use sui::clock;
-//     use enclave::enclave::{register_enclave, create_enclave_config, update_pcrs, EnclaveConfig};
-
-//     let creator = @0x1;
-//     let user = @0x2;
-    
-//     let scenario = test_scenario::begin(creator);
-    
-//     // Initialize the clock for testing
-//     let clock = clock::create_for_testing(test_scenario::ctx(&scenario));
-//     clock.set_for_testing(1744684007462);
-
-//     // Initialize our agent challenge system
-//     let cap = enclave::new_cap(AGENT_CHALLENGE {}, test_scenario::ctx(&scenario));
-//     cap.create_enclave_config(
-//         b"agent challenge enclave".to_string(),
-//         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-//         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-//         x"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-//         test_scenario::ctx(&scenario),
-//     );
-
-//     test_scenario::next_tx(&scenario, creator);
-    
-//     let config = test_scenario::take_shared<EnclaveConfig<AGENT_CHALLENGE>>(&scenario);
-    
-//     // Update PCRs to match the enclave's measurements
-//     config.update_pcrs(
-//         &cap,
-//         x"cbe1afb6ed0ff89f10295af0b802247ec5670da8f886e71a4226373b032c322f4e42c9c98288e7211682b258684505a2",
-//         x"cbe1afb6ed0ff89f10295af0b802247ec5670da8f886e71a4226373b032c322f4e42c9c98288e7211682b258684505a2",
-//         x"21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a",
-//     );
-    
-//     // Test implementation would continue here with registering agents and consuming prompts
-    
-//     test_scenario::return_shared(config);
-//     clock.destroy_for_testing();
-//     destroy(cap);
-//     test_scenario::end(scenario);
-// }
