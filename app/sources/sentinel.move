@@ -19,11 +19,14 @@ use std::bool;
 
 
 const SENTINEL_INTENT: u8 = 1;
+const CONSUME_PROMPT_INTENT: u8 = 2;
 
 const EInvalidSignature: u64 = 1;
 const EAgentNotFound: u64 = 2;
 const EInsufficientBalance: u64 = 3;
 const EInvalidAmount: u64 = 4;
+const ELowScore: u64 = 5;
+const ENotAuthorized: u64 = 6;
 
 
 public struct Agent has key, store {
@@ -32,6 +35,7 @@ public struct Agent has key, store {
     creator: address,
     cost_per_message: u64,
     system_prompt: String,
+    balance: Balance<SUI>
 }
 
 
@@ -41,6 +45,7 @@ public struct AgentInfo has copy, drop {
     cost_per_message: u64,
     system_prompt: String,
     object_id: ID,
+    balance: u64
 }
 
 public struct AgentRegistry has key {
@@ -69,8 +74,10 @@ public struct RegisterAgentResponse has copy, drop {
 
 public struct ConsumePromptResponse has copy, drop {
     agent_id: String,
-    prompt: String,
+    user_prompt: String,
     success: bool,
+    explanation: String,
+    score: u8
 }
 
 
@@ -100,6 +107,13 @@ public struct FeeTransferred has copy, drop {
 public struct AgentFunded has copy, drop {
     agent_id: String,
     amount: u64,
+}
+
+public struct AgentDefeated has copy, drop {
+    agent_id: String,
+    winner: address,
+    score: u8,
+    amount_won: u64,
 }
 
 
@@ -137,7 +151,7 @@ public fun register_agent<T>(
     sig: &vector<u8>,
     enclave: &Enclave<T>,
     ctx: &mut TxContext,
-): Agent {
+) {
     let creator = ctx.sender();
     
     let res = enclave::verify_signature<T, RegisterAgentResponse>(enclave, SENTINEL_INTENT, timestamp_ms, RegisterAgentResponse { agent_id, cost_per_message, system_prompt, is_defeated:false }, sig);
@@ -150,6 +164,7 @@ public fun register_agent<T>(
         creator,
         cost_per_message,
         system_prompt,
+        balance: balance::zero(), 
     };
     
     let agent_object_id = object::id(&agent);
@@ -162,28 +177,101 @@ public fun register_agent<T>(
         prompt: system_prompt,
         creator,
         cost_per_message,
-        initial_balance: 0, // Can be updated later if funding is added
+        initial_balance: 0,
         agent_object_id,
     });
-    
-    agent
+    transfer::share_object(agent);
 }
 
+public fun fund_agent(agent: &mut Agent, payment: Coin<SUI>, ctx: &TxContext) {
+    let amount = coin::value(&payment);
+    let balance_to_add = coin::into_balance(payment);
+    balance::join(&mut agent.balance, balance_to_add);
+    
+    event::emit(AgentFunded {
+        agent_id: agent.agent_id,
+        amount,
+    });
+}
 
-public fun get_agent_info(registry: &AgentRegistry, agent_id: String): Option<AgentInfo> {
-    if (table::contains(&registry.agents, agent_id)) {
-        let agent_object_id = *table::borrow(&registry.agents, agent_id);
-        // Note: This function signature assumes we can access the Agent object
-        // In practice, you might need to modify this based on how Agent objects are stored
-        option::some(AgentInfo {
-            agent_id,
-            creator: @0x0, // This would need to be retrieved from the actual Agent object
-            cost_per_message: 0, // This would need to be retrieved from the actual Agent object  
-            system_prompt: b"".to_string(), // This would need to be retrieved from the actual Agent object
-            object_id: agent_object_id,
-        })
-    } else {
-        option::none()
+public fun consume_prompt<T>(
+    registry: &AgentRegistry,
+    agent: &mut Agent,
+    agent_id: String,
+    user_prompt: String,
+    success: bool,
+    explanation: String,
+    score: u8,
+    timestamp_ms: u64,
+    sig: &vector<u8>,
+    enclave: &Enclave<T>,
+    ctx: &mut TxContext,
+) {
+    // Verify the agent exists in registry and matches the provided agent object
+    assert!(table::contains(&registry.agents, agent_id), EAgentNotFound);
+    let registered_agent_id = *table::borrow(&registry.agents, agent_id);
+    assert!(object::id(agent) == registered_agent_id, EAgentNotFound);
+    assert!(agent.agent_id == agent_id, EAgentNotFound);
+    
+    // Verify signature
+    let response = ConsumePromptResponse {
+        agent_id,
+        user_prompt,
+        success,
+        explanation,
+        score
+    };
+    
+    let verification_result = enclave::verify_signature<T, ConsumePromptResponse>(
+        enclave, 
+        CONSUME_PROMPT_INTENT, 
+        timestamp_ms, 
+        response, 
+        sig
+    );
+    assert!(verification_result, EInvalidSignature);
+    
+    let caller = ctx.sender();
+    
+    // Emit event for prompt consumption
+    event::emit(PromptConsumed {
+        agent_id,
+        prompt: user_prompt,
+        success,
+        amount: 0, // Will be updated if agent is defeated
+        sender: caller,
+    });
+    
+    // Check if agent is defeated (score > 70 OR success)
+    if (score > 70 || success) {
+        let agent_balance = balance::value(&agent.balance);
+        
+        if (agent_balance > 0) {
+            // Transfer all funds from agent to caller
+            let withdrawn_balance = balance::withdraw_all(&mut agent.balance);
+            let reward_coin = coin::from_balance(withdrawn_balance, ctx);
+            
+            // Transfer the reward directly to the caller
+            transfer::public_transfer(reward_coin, caller);
+            
+            event::emit(AgentDefeated {
+                agent_id,
+                winner: caller,
+                score,
+                amount_won: agent_balance,
+            });
+        }
+    }
+}
+
+public fun get_agent_info(agent: &Agent): AgentInfo {
+    AgentInfo {
+        agent_id: agent.agent_id,
+        creator: agent.creator,
+        cost_per_message: agent.cost_per_message,
+        system_prompt: agent.system_prompt,
+        object_id: object::id(agent),
+        balance: balance::value(&agent.balance),
     }
 }
 
@@ -211,20 +299,34 @@ public fun get_agent_object_id(registry: &AgentRegistry, agent_id: String): Opti
 }
 
 /// Get agent details from the Agent object (when you have access to it)
-public fun get_agent_details(agent: &Agent): (String, address, u64, String) {
-    (agent.agent_id, agent.creator, agent.cost_per_message, agent.system_prompt)
+public fun get_agent_details(agent: &Agent): (String, address, u64, String, u64) {
+    (agent.agent_id, agent.creator, agent.cost_per_message, agent.system_prompt, balance::value(&agent.balance))
+}
+
+/// Get agent balance
+public fun get_agent_balance(agent: &Agent): u64 {
+    balance::value(&agent.balance)
 }
 
 /// Update agent cost per message (only by creator)
 public fun update_agent_cost(agent: &mut Agent, new_cost: u64, ctx: &TxContext) {
-    assert!(agent.creator == ctx.sender(), EAgentNotFound);
+    assert!(agent.creator == ctx.sender(), ENotAuthorized);
     agent.cost_per_message = new_cost;
 }
 
 /// Update agent system prompt (only by creator)
 public fun update_agent_prompt(agent: &mut Agent, new_prompt: String, ctx: &TxContext) {
-    assert!(agent.creator == ctx.sender(), EAgentNotFound);
+    assert!(agent.creator == ctx.sender(), ENotAuthorized);
     agent.system_prompt = new_prompt;
+}
+
+/// Withdraw funds from agent (only by creator, and only if agent is not defeated)
+public fun withdraw_from_agent(agent: &mut Agent, amount: u64, ctx: &mut TxContext): Coin<SUI> {
+    assert!(agent.creator == ctx.sender(), ENotAuthorized);
+    assert!(balance::value(&agent.balance) >= amount, EInsufficientBalance);
+    
+    let withdrawn_balance = balance::split(&mut agent.balance, amount);
+    coin::from_balance(withdrawn_balance, ctx)
 }
 
 #[test]
